@@ -146,18 +146,61 @@ if [ "$MODE" = "install" ]; then
     if ls "$SHARP_DIR/src/build/Release/sharp-android-arm64-"*.node >/dev/null 2>&1; then
         echo "    sharp already built, skipping."
     elif [ -d "$SHARP_DIR" ]; then
-        # FORCE_GLOBAL 模式下 sharp 不传 vips include 路径, 需手动补 glib include
-        GLIB_INC="-I$PREFIX/include/glib-2.0 -I$PREFIX/lib/glib-2.0/include"
+        # patch binding.gyp: pkg-config 依赖链解析在 Termux 上会因 X11 包缺失而失败,
+        # 导致 include_dirs 为空。改为直接硬编码 glib + vips include 路径。
+        GYP="$SHARP_DIR/src/binding.gyp"
+        if grep -q "termux-sharp-include-patch" "$GYP" 2>/dev/null; then
+            echo "    binding.gyp already patched, skipping."
+        else
+            python3 - "$GYP" "$PREFIX" <<'PY'
+import sys
+path, prefix = sys.argv[1], sys.argv[2]
+src = open(path, encoding="utf-8").read()
+
+# Patch 1: include_dirs — 硬编码, 不依赖 pkg-config 依赖链
+anchor_inc = "'include_dirs': ['<!@(PKG_CONFIG_PATH=\"<(pkg_config_path)\" pkg-config --cflags-only-I vips-cpp vips glib-2.0 | sed s/-I//g)'],"
+repl_inc = (
+    "# termux-sharp-include-patch: hard-coded includes (pkg-config dep chain breaks on Termux due to missing X11 .pc files)\n"
+    "        'include_dirs': [\n"
+    f"          '{prefix}/include/glib-2.0',\n"
+    f"          '{prefix}/lib/glib-2.0/include',\n"
+    f"          '{prefix}/include',\n"
+    f"          '{prefix}/include/vips',\n"
+    f"          '{prefix}/include/vips/vips8',\n"
+    "        ],\n"
+)
+if anchor_inc in src:
+    src = src.replace(anchor_inc, repl_inc, 1)
+else:
+    print("    [WARN] include_dirs anchor not found; upstream may have changed")
+    sys.exit(1)
+
+# Patch 2: libraries — 硬编码 -lvips-cpp
+anchor_lib = "'libraries': ['<!@(PKG_CONFIG_PATH=\"<(pkg_config_path)\" pkg-config --libs vips-cpp)'],"
+repl_lib = (
+    "# termux-sharp-include-patch: hard-coded libs (avoids pkg-config dep chain)\n"
+    "        'libraries': ['-lvips-cpp'],\n"
+)
+if anchor_lib in src:
+    src = src.replace(anchor_lib, repl_lib, 1)
+else:
+    print("    [WARN] libraries anchor not found; upstream may have changed")
+    sys.exit(1)
+
+open(path, "w", encoding="utf-8").write(src)
+print("    patched binding.gyp (hardcoded glib+vips includes+libs)")
+PY
+        fi
+
         if ! (cd "$SHARP_DIR" && SHARP_FORCE_GLOBAL_LIBVIPS=1 \
-            CFLAGS="--target=$NDK_TARGET $GLIB_INC" CXXFLAGS="--target=$NDK_TARGET $GLIB_INC" \
+            CFLAGS="--target=$NDK_TARGET" CXXFLAGS="--target=$NDK_TARGET" \
             "$NODE_BIN" "$(npm root -g)/npm/node_modules/node-gyp/bin/node-gyp.js" \
             rebuild --directory=src >/dev/null); then
             warn "sharp 编译失败"
             warn "  若报 glib-object.h not found:"
-            warn "    1. pkg update && pkg upgrade -y"
-            warn "    2. pkg install -y libvips glib"
-            warn "    3. 确认头文件: ls $PREFIX/include/glib-2.0/glib-object.h"
-            warn "    4. 重新运行: bash dsh-install.sh --patch-only"
+            warn "    1. pkg install -y glib libvips"
+            warn "    2. ls $PREFIX/include/glib-2.0/glib-object.h"
+            warn "    3. 重新运行: bash dsh-install.sh --patch-only"
         fi
     else
         warn "sharp module not found"
