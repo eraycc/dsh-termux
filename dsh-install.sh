@@ -364,6 +364,12 @@ def patch(path, marker, transforms):
                 src = src.replace("\trm: (path) => rm(path, { force: true })\n\nconst defaultInternals", "\trm: (path) => rm(path, { force: true })\n};\nconst defaultInternals", 1)
             # 写回修复后的文件, 继续执行下面的 patch 逻辑
             path.write_text(src, encoding="utf-8")
+            # 关键: 上面已就地修复损坏的 patch 状态并写回,
+            # 直接判定完成。若落入下面的常规 transforms 流程, 幂等的
+            # "publish link->rename" 会失配(文件里已无旧 link 调用),
+            # 导致 install 模式误报"补丁未完全生效"并以非零码退出。
+            results[-1] = (name, f"REPAIRED ({repair_reason})")
+            return
         else:
             results.append((name, "OK (already patched)"))
             return
@@ -495,13 +501,16 @@ def sp_fix_missing_close(s):
     anchor = "\trm: (path) => rm(path, { force: true })\n\nconst defaultInternals"
     if anchor in s:
         return s.replace(anchor, "\trm: (path) => rm(path, { force: true })\n};\nconst defaultInternals", 1)
-    return None
+    # 当前上游(defaultFileSystem 以 \n}; 正常收尾)本步无需动作。
+    # 返回 s 表示已检查且无需改动 —— 返回 None 会被误报为"失配",
+    # 即使文件本身完好也会让 install 模式以非零码退出。
+    return s
 
 patch(SP_PATH, "termux-publish-fallback", [
     ("import rename", sp_import),
     ("defaultFileSystem rename", sp_default_fs),
     ("fix missing };", sp_fix_missing_close),
-    ("publish link->rename", once(
+    ("publish link->rename", (lambda o, n: (lambda s: n if o in s else (s if n in s else None)))(
         "await internals.fs.link(staged, currentPath);",
         "/* termux-publish-fallback */\n\t\tawait internals.fs.rename(staged, currentPath);",
     )),
