@@ -324,15 +324,23 @@ def patch(path, marker, transforms):
         return
     src = path.read_text(encoding="utf-8")
     if marker in src:
-        # 检测 marker 存在但 patch 不完整（如手动 patch 残留错误格式）
-        # 如果 link 调用还在且 rename 也在，说明 patch 格式错误，需要重新 patch
+        # 检测 marker 存在但 patch 不完整或文件损坏
+        # 情况 1: link 和 rename 同时存在(手动 patch 残留错误格式)
+        # 情况 2: defaultFileSystem 缺少 }(rm 行后直接接 const defaultInternals)
+        needs_repair = False
         if "await internals.fs.link(staged, currentPath);" in src and "await internals.fs.rename(staged, currentPath);" in src:
-            # 强制重新 patch: 先移除旧的错误 patch，再应用正确 patch
-            results.append((name, "REPAIR (marker present but malformed)"))
+            needs_repair = True
+            repair_reason = "malformed publish patch"
+        elif "\trm: (path) => rm(path, { force: true })\n\nconst defaultInternals" in src:
+            needs_repair = True
+            repair_reason = "missing }; in defaultFileSystem"
+        if needs_repair:
+            results.append((name, f"REPAIR ({repair_reason})"))
             if CHECK_ONLY:
                 return
-            # 移除旧 patch 代码块
-            old_block = """	} catch (error) {
+            # 情况 1: 移除旧的错误 publish patch
+            if "await internals.fs.link(staged, currentPath);" in src and "await internals.fs.rename(staged, currentPath);" in src:
+                old_block = """	} catch (error) {
 	/* termux-publish-fallback */
 	if (error instanceof Error && "code" in error && error.code === "EACCES") {
 		await internals.fs.rename(staged, currentPath);
@@ -343,15 +351,19 @@ def patch(path, marker, transforms):
 		throw error;
 	}
 	}"""
-            new_block = """	} catch (error) {
+                new_block = """	} catch (error) {
 		/* v8 ignore else -- a non-collision filesystem error propagates unchanged. */
 		if (isEEXIST(error)) return false;
 		/* v8 ignore next -- the filesystem error is already complete. */
 		throw error;
 	}"""
-            if old_block in src:
-                src = src.replace(old_block, new_block, 1)
-            # 继续执行下面的 patch 逻辑
+                if old_block in src:
+                    src = src.replace(old_block, new_block, 1)
+            # 情况 2: 补上缺失的 };
+            if "\trm: (path) => rm(path, { force: true })\n\nconst defaultInternals" in src:
+                src = src.replace("\trm: (path) => rm(path, { force: true })\n\nconst defaultInternals", "\trm: (path) => rm(path, { force: true })\n};\nconst defaultInternals", 1)
+            # 写回修复后的文件, 继续执行下面的 patch 逻辑
+            path.write_text(src, encoding="utf-8")
         else:
             results.append((name, "OK (already patched)"))
             return
@@ -465,19 +477,30 @@ def sp_import(s):
     return s[:m.start()] + 'import { ' + ", ".join(names) + ' } from "node:fs/promises";' + s[m.end():]
 
 def sp_default_fs(s):
-    m = re.search(r'(const defaultFileSystem = \{\n)((?:\t[^\n]*\n)+?)(\};)', s)
-    if not m:
+    # 找 defaultFileSystem 对象里的 link, 行, 在它后面加 rename,
+    # 不用正则匹配整个对象块(上游格式可能变化), 只精确替换 \tlink,\n -> \tlink,\n\trename,\n
+    if "\tlink,\n" not in s:
         return None
-    block = m.group(2)
-    if re.search(r'^\trename,\s*$', block, re.M):
-        return s
-    if "\tlink,\n" not in block:
-        return None
-    return s[:m.start(2)] + block.replace("\tlink,\n", "\tlink,\n\trename,\n", 1) + s[m.end():]
+    # 检查是否已有 rename,
+    m = re.search(r'const defaultFileSystem = \{\n((?:\t[^\n]*\n)+)', s)
+    if m:
+        block = m.group(1)
+        if re.search(r'^\trename,\s*$', block, re.M):
+            return s  # 已有 rename
+    return s.replace("\tlink,\n", "\tlink,\n\trename,\n", 1)
+
+def sp_fix_missing_close(s):
+    # 修复 defaultFileSystem 对象缺少 }; 的情况
+    # 如果 rm 行后面直接接 const defaultInternals(中间没有 };), 补上 };
+    anchor = "\trm: (path) => rm(path, { force: true })\n\nconst defaultInternals"
+    if anchor in s:
+        return s.replace(anchor, "\trm: (path) => rm(path, { force: true })\n};\nconst defaultInternals", 1)
+    return None
 
 patch(SP_PATH, "termux-publish-fallback", [
     ("import rename", sp_import),
     ("defaultFileSystem rename", sp_default_fs),
+    ("fix missing };", sp_fix_missing_close),
     ("publish link->rename", once(
         "await internals.fs.link(staged, currentPath);",
         "/* termux-publish-fallback */\n\t\tawait internals.fs.rename(staged, currentPath);",
