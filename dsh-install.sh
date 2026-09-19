@@ -324,8 +324,37 @@ def patch(path, marker, transforms):
         return
     src = path.read_text(encoding="utf-8")
     if marker in src:
-        results.append((name, "OK (already patched)"))
-        return
+        # 检测 marker 存在但 patch 不完整（如手动 patch 残留错误格式）
+        # 如果 link 调用还在且 rename 也在，说明 patch 格式错误，需要重新 patch
+        if "await internals.fs.link(staged, currentPath);" in src and "await internals.fs.rename(staged, currentPath);" in src:
+            # 强制重新 patch: 先移除旧的错误 patch，再应用正确 patch
+            results.append((name, "REPAIR (marker present but malformed)"))
+            if CHECK_ONLY:
+                return
+            # 移除旧 patch 代码块
+            old_block = """	} catch (error) {
+	/* termux-publish-fallback */
+	if (error instanceof Error && "code" in error && error.code === "EACCES") {
+		await internals.fs.rename(staged, currentPath);
+	} else {
+		/* v8 ignore else -- a non-collision filesystem error propagates unchanged. */
+		if (isEEXIST(error)) return false;
+		/* v8 ignore next -- the filesystem error is already complete. */
+		throw error;
+	}
+	}"""
+            new_block = """	} catch (error) {
+		/* v8 ignore else -- a non-collision filesystem error propagates unchanged. */
+		if (isEEXIST(error)) return false;
+		/* v8 ignore next -- the filesystem error is already complete. */
+		throw error;
+	}"""
+            if old_block in src:
+                src = src.replace(old_block, new_block, 1)
+            # 继续执行下面的 patch 逻辑
+        else:
+            results.append((name, "OK (already patched)"))
+            return
     if CHECK_ONLY:
         results.append((name, "NEEDS PATCH"))
         return
