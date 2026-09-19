@@ -71,7 +71,16 @@ NDK_TARGET="aarch64-unknown-linux-android30"
 # ============================================================
 if [ "$MODE" = "install" ]; then
     log 1/7 "Installing prerequisites..."
-    pkg install -y nodejs build-essential clang cmake ninja python libvips libvips-dev ripgrep >/dev/null
+    pkg install -y nodejs build-essential clang cmake ninja python ripgrep >/dev/null
+
+    # libvips 单独装并校验: Termux 无 libvips-dev 包, libvips 本身含头文件;
+    # 若缺 GLib 依赖(glib-object.h 找不到)则单独补装 glib
+    pkg install -y libvips >/dev/null 2>&1 || warn "libvips 安装失败, sharp 编译将跳过"
+    # 检查 glib 头文件是否可用
+    if [ ! -f "$PREFIX/include/glib-object.h" ] && [ ! -f "$PREFIX/include/glib-2.0/glib-object.h" ]; then
+        warn "glib 头文件未找到, 尝试安装 glib..."
+        pkg install -y glib >/dev/null 2>&1 || true
+    fi
 
     if ! NODE_BIN="$(command -v node)"; then
         err "'node' not found after pkg install"; exit 1
@@ -138,10 +147,14 @@ if [ "$MODE" = "install" ]; then
     if ls "$SHARP_DIR/src/build/Release/sharp-android-arm64-"*.node >/dev/null 2>&1; then
         echo "    sharp already built, skipping."
     elif [ -d "$SHARP_DIR" ]; then
-        (cd "$SHARP_DIR" && SHARP_FORCE_GLOBAL_LIBVIPS=1 \
+        if ! (cd "$SHARP_DIR" && SHARP_FORCE_GLOBAL_LIBVIPS=1 \
             CFLAGS="--target=$NDK_TARGET" CXXFLAGS="--target=$NDK_TARGET" \
             "$NODE_BIN" "$(npm root -g)/npm/node_modules/node-gyp/bin/node-gyp.js" \
-            rebuild --directory=src >/dev/null) || warn "sharp build failed (will retry on demand)"
+            rebuild --directory=src >/dev/null); then
+            warn "sharp 编译失败"
+            warn "  常见原因: glib 头文件缺失 -> pkg install glib libvips"
+            warn "  修复后重新运行: bash dsh-install.sh --patch-only"
+        fi
     else
         warn "sharp module not found"
     fi
