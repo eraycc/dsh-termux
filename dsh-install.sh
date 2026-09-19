@@ -73,13 +73,12 @@ if [ "$MODE" = "install" ]; then
     log 1/7 "Installing prerequisites..."
     pkg install -y nodejs build-essential clang cmake ninja python ripgrep >/dev/null
 
-    # libvips 单独装并校验: Termux 无 libvips-dev 包, libvips 本身含头文件;
-    # 若缺 GLib 依赖(glib-object.h 找不到)则单独补装 glib
-    pkg install -y libvips >/dev/null 2>&1 || warn "libvips 安装失败, sharp 编译将跳过"
-    # 检查 glib 头文件是否可用
-    if [ ! -f "$PREFIX/include/glib-object.h" ] && [ ! -f "$PREFIX/include/glib-2.0/glib-object.h" ]; then
-        warn "glib 头文件未找到, 尝试安装 glib..."
-        pkg install -y glib >/dev/null 2>&1 || true
+    # libvips + glib: Termux 无 libvips-dev 包, libvips 本身含头文件
+    pkg install -y libvips glib >/dev/null 2>&1 || warn "libvips/glib 安装失败, sharp 编译将跳过"
+    # 校验 glib-object.h 是否存在; 不存在则尝试升级
+    if [ ! -f "$PREFIX/include/glib-2.0/glib-object.h" ] && [ ! -f "$PREFIX/include/glib-object.h" ]; then
+        warn "glib-object.h 未找到, 尝试 pkg upgrade..."
+        pkg upgrade -y libvips glib >/dev/null 2>&1 || true
     fi
 
     if ! NODE_BIN="$(command -v node)"; then
@@ -147,13 +146,18 @@ if [ "$MODE" = "install" ]; then
     if ls "$SHARP_DIR/src/build/Release/sharp-android-arm64-"*.node >/dev/null 2>&1; then
         echo "    sharp already built, skipping."
     elif [ -d "$SHARP_DIR" ]; then
+        # FORCE_GLOBAL 模式下 sharp 不传 vips include 路径, 需手动补 glib include
+        GLIB_INC="-I$PREFIX/include/glib-2.0 -I$PREFIX/lib/glib-2.0/include"
         if ! (cd "$SHARP_DIR" && SHARP_FORCE_GLOBAL_LIBVIPS=1 \
-            CFLAGS="--target=$NDK_TARGET" CXXFLAGS="--target=$NDK_TARGET" \
+            CFLAGS="--target=$NDK_TARGET $GLIB_INC" CXXFLAGS="--target=$NDK_TARGET $GLIB_INC" \
             "$NODE_BIN" "$(npm root -g)/npm/node_modules/node-gyp/bin/node-gyp.js" \
             rebuild --directory=src >/dev/null); then
             warn "sharp 编译失败"
-            warn "  常见原因: glib 头文件缺失 -> pkg install glib libvips"
-            warn "  修复后重新运行: bash dsh-install.sh --patch-only"
+            warn "  若报 glib-object.h not found:"
+            warn "    1. pkg update && pkg upgrade -y"
+            warn "    2. pkg install -y libvips glib"
+            warn "    3. 确认头文件: ls $PREFIX/include/glib-2.0/glib-object.h"
+            warn "    4. 重新运行: bash dsh-install.sh --patch-only"
         fi
     else
         warn "sharp module not found"
