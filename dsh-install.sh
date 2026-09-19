@@ -71,7 +71,7 @@ NDK_TARGET="aarch64-unknown-linux-android30"
 # ============================================================
 if [ "$MODE" = "install" ]; then
     log 1/7 "Installing prerequisites..."
-    pkg install -y nodejs build-essential clang cmake ninja python libvips ripgrep >/dev/null
+    pkg install -y nodejs build-essential clang cmake ninja python libvips libvips-dev ripgrep >/dev/null
 
     if ! NODE_BIN="$(command -v node)"; then
         err "'node' not found after pkg install"; exit 1
