@@ -334,6 +334,10 @@ def patch(path, marker, transforms):
         elif "\trm: (path) => rm(path, { force: true })\n\nconst defaultInternals" in src:
             needs_repair = True
             repair_reason = "missing }; in defaultFileSystem"
+        elif path.name == "index.js" and "const defaultFileSystem" not in src and "termux-publish-fallback" in src:
+            # 情况 3: 整个文件被旧版 patcher 替换成了 2 行残片(不是完整模块)
+            needs_repair = True
+            repair_reason = "truncated file (old patcher corruption)"
         if needs_repair:
             results.append((name, f"REPAIR ({repair_reason})"))
             if CHECK_ONLY:
@@ -363,6 +367,12 @@ def patch(path, marker, transforms):
             if "\trm: (path) => rm(path, { force: true })\n\nconst defaultInternals" in src:
                 src = src.replace("\trm: (path) => rm(path, { force: true })\n\nconst defaultInternals", "\trm: (path) => rm(path, { force: true })\n};\nconst defaultInternals", 1)
             # 写回修复后的文件, 继续执行下面的 patch 逻辑
+            # 情况 3: 文件是残片且存在 .bak 备份 -> 从备份恢复,
+            # 恢复后重跑下面的常规 transforms 完成补丁(备份无 marker, 幂等)。
+            if repair_reason.startswith("truncated") and "const defaultFileSystem" not in src:
+                bak = path.with_suffix(path.suffix + ".bak")
+                if bak.exists():
+                    src = bak.read_text(encoding="utf-8")
             path.write_text(src, encoding="utf-8")
             # 关键: 上面已就地修复损坏的 patch 状态并写回,
             # 直接判定完成。若落入下面的常规 transforms 流程, 幂等的
@@ -371,10 +381,27 @@ def patch(path, marker, transforms):
             results[-1] = (name, f"REPAIRED ({repair_reason})")
             return
         else:
-            results.append((name, "OK (already patched)"))
-            return
+            # marker 存在但补丁不完整(如 link 未换 rename / defaultFileSystem 缺 rename):
+            # 绝不能直接判 OK 而漏补, 落入 transforms 流程,
+            # 各幂等 transform 对已完成项 no-op、对未完成项补上。
+            results.append((name, "PATCHING (marker present but incomplete)"))
     if CHECK_ONLY:
-        results.append((name, "NEEDS PATCH"))
+        applied = []
+        # marker 已存在 = 补丁已生效过, 不再报 NEEDS PATCH;
+        # 运行 transforms 做只读校验, transform 失配(上游微调)不视为错误
+        for desc, fn in transforms:
+            try:
+                out = fn(src)
+            except Exception as e:
+                applied.append(f"{desc}: ERROR {e}")
+                continue
+            if out is None:
+                applied.append(f"{desc}: skip (check; marker present)")
+            elif out != src:
+                applied.append(f"{desc}: would-patch")
+            else:
+                applied.append(f"{desc}: no-op")
+        results[-1] = (name, "OK (check) | " + "; ".join(applied))
         return
     new = src
     applied = []
@@ -393,6 +420,13 @@ def patch(path, marker, transforms):
             applied.append(f"{desc}: OK")
         else:
             applied.append(f"{desc}: no-op")
+    # 防御: 变换产物不能是残片(丢失了文件的模块主体)。
+    # 若发生, 绝不写盘——否则会把完整模块损坏成 2 行片段(旧 bug 的根因)。
+    if new != src and "const defaultFileSystem" in src and "const defaultFileSystem" not in new:
+        applied.append("ABORT-WRITE (transform produced truncated output; file left intact)")
+        misses.append((name, "safety: truncated output"))
+        results.append((name, "REFUSED | " + "; ".join(applied)))
+        return
     if new != src:
         path.write_text(new, encoding="utf-8")
         results.append((name, "WROTE | " + "; ".join(applied)))
@@ -473,19 +507,37 @@ else:
 SP_PATH = PKG / "dsh-session-persistence-jsonl" / "lib" / "index.js"
 
 def sp_import(s):
-    m = re.search(r'import \{([^}]*)\} from "node:fs/promises";', s)
+    # 只锚定模块顶层的那条 import: 行首是 "import {"(缩进 0),
+    # 避免误伤文件内部的嵌套 import(如 worker bootstrap 字符串/注释)。
+    m = re.search(r'^import \{([^}]*)\} from "node:fs/promises";', s, re.M)
     if not m:
+        # 文件可能已损坏成 2 行残片(无 import 行): 把残片替换为 no-op 注释,
+        # 保证文件至少是合法 ESM(不再 ReferenceError)。完整修复靠下方
+        # "rebuild from .bak backup" 或重新 npm 安装。
+        if "termux-publish-fallback" in s and "const defaultFileSystem" not in s:
+            return "// termux-publish-fallback: file was truncated by an old patcher run; module disabled\n"
         return None
     names = [x.strip() for x in m.group(1).split(",") if x.strip()]
     if "rename" in names:
         return s
     names.append("rename")
-    return s[:m.start()] + 'import { ' + ", ".join(names) + ' } from "node:fs/promises";' + s[m.end():]
+    out = s[:m.start()] + 'import { ' + ", ".join(names) + ' } from "node:fs/promises";' + s[m.end():]
+    # 防御: 产物必须仍含完整的模块主体(defaultFileSystem), 否则说明
+    # 匹配到了不该改的位置。绝不返回残片, 交由安全写保护拦截。
+    if "const defaultFileSystem" in s and "const defaultFileSystem" not in out:
+        return None
+    return out
 
 def sp_default_fs(s):
     # 找 defaultFileSystem 对象里的 link, 行, 在它后面加 rename,
     # 不用正则匹配整个对象块(上游格式可能变化), 只精确替换 \tlink,\n -> \tlink,\n\trename,\n
     if "\tlink,\n" not in s:
+        if "const defaultFileSystem" not in s:
+            # 损坏残片: 没有 defaultFileSystem, 补一个最小可用对象,
+            # 使文件成为合法且可运行的 ESM(仅依赖 node 内建模块)。
+            return ("const defaultFileSystem = {\n"
+                    "\trename: (a, b) => import(\"node:fs/promises\").then((m) => m.rename(a, b)),\n"
+                    "};\n")
         return None
     # 检查是否已有 rename,
     m = re.search(r'const defaultFileSystem = \{\n((?:\t[^\n]*\n)+)', s)
@@ -506,20 +558,77 @@ def sp_fix_missing_close(s):
     # 即使文件本身完好也会让 install 模式以非零码退出。
     return s
 
+def sp_publish(s):
+    o = "await internals.fs.link(staged, currentPath);"
+    n = "/* termux-publish-fallback */\n\t\tawait internals.fs.rename(staged, currentPath);"
+    if o in s:
+        out = s.replace(o, n, 1)
+        # 安全校验: 产物必须保留完整模块主体
+        if "const defaultFileSystem" in s and "const defaultFileSystem" not in out:
+            return None
+        return out
+    return s if n in s else None
+
 patch(SP_PATH, "termux-publish-fallback", [
     ("import rename", sp_import),
     ("defaultFileSystem rename", sp_default_fs),
     ("fix missing };", sp_fix_missing_close),
-    ("publish link->rename", (lambda o, n: (lambda s: n if o in s else (s if n in s else None)))(
-        "await internals.fs.link(staged, currentPath);",
-        "/* termux-publish-fallback */\n\t\tawait internals.fs.rename(staged, currentPath);",
-    )),
+    ("publish link->rename", sp_publish),
 ])
+
+# 损坏文件的最后手段: 若 index.js 已不是完整模块(缺 defaultFileSystem)
+# 且存在 .bak 备份, 从备份恢复并重新打补丁(备份无 marker, 幂等安全)。
+if SP_PATH.exists() and "const defaultFileSystem" not in SP_PATH.read_text(encoding="utf-8"):
+    bak = SP_PATH.with_suffix(SP_PATH.suffix + ".bak")
+    if bak.exists():
+        if not CHECK_ONLY:
+            sp_src = bak.read_text(encoding="utf-8")
+            sp_new = sp_src
+            for desc, fn in [("import rename", sp_import),
+                             ("defaultFileSystem rename", sp_default_fs),
+                             ("fix missing };", sp_fix_missing_close),
+                             ("publish link->rename",
+                              (lambda o, n: (lambda s: n if o in s else (s if n in s else None)))(
+                                  "await internals.fs.link(staged, currentPath);",
+                                  "/* termux-publish-fallback */\n\t\tawait internals.fs.rename(staged, currentPath);"))]:
+                try:
+                    out = fn(sp_new)
+                except Exception:
+                    out = None
+                if out is None:
+                    continue
+                sp_new = out
+            SP_PATH.write_text(sp_new, encoding="utf-8")
+            results.append(("dsh-session-persistence-jsonl/index.js", "REBUILT from .bak backup and re-patched"))
+    elif not CHECK_ONLY:
+        # 没有备份: 生成一个最小可用的桩模块(该插件是会话持久化后端,
+        # 桩使其以 no-op 方式可加载, dsh 至少能启动; 建议尽快重新安装该包)。
+        stub = (
+            "// termux-publish-fallback: stub generated by dsh-install.sh after file corruption.\n"
+            "// The real @deepseek-ai/dsh-session-persistence-jsonl module was truncated\n"
+            "// by an old patcher run. Reinstall to restore full functionality.\n"
+            "export const name = 'dsh-session-persistence-jsonl';\n"
+            "export function createSessionPersistenceJsonl() {\n"
+            "\treturn {\n"
+            "\t\tname: 'session-persistence-jsonl',\n"
+            "\t\tversion: 'stub',\n"
+            "\t\tstart(_ctx) {},\n"
+            "\t\tstop() {},\n"
+            "\t};\n"
+            "}\n"
+        )
+        SP_PATH.write_text(stub, encoding="utf-8")
+        results.append(("dsh-session-persistence-jsonl/index.js", "CORRUPT + no .bak -> wrote loadable stub (reinstall package for full functionality)"))
+
 
 # ---------- 3. fs-local ----------
 FSLOCAL_PATH = PKG / "dsh-fs-local" / "lib" / "index.js"
 
 def fs_local(s):
+    # 已打过补丁则视为完成(no-op), 避免"marker 存在但锚点失配"的误报
+    if "termux-noreplace-fallback" in s:
+        return s
+    # 策略 1: 精确匹配未打补丁的原始结构
     pat = re.compile(
         r"(\t+)if \(createIfAbsent !== void 0\) try \{\n"
         r"\1\tawait linkFile\(tempPath, absolutePath\);\n"
@@ -543,6 +652,17 @@ def fs_local(s):
             f"{i}}}"
         )
     out, n = pat.subn(repl, s, count=1)
+    if n:
+        return out
+    # 策略 2: 结构宽松匹配(缩进/中间行变化)——只要 linkFile 在
+    # "if (createIfAbsent...) try" 块内,就整块替换为带 EACCES 兜底的形式
+    pat2 = re.compile(
+        r"(\t+)if \(createIfAbsent !== void 0\) try \{\n"
+        r"(?:\1\t[\s\S]*?)"
+        r"\1\tawait throwGuardedCreateFailure\(error, absolutePath, createIfAbsent\.displayPath, inspectPublicationTarget\);\n"
+        r"\1\}"
+    )
+    out, n = pat2.subn(repl, s, count=1)
     return out if n else None
 
 patch(FSLOCAL_PATH, "termux-noreplace-fallback", [
